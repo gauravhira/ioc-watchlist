@@ -1,53 +1,73 @@
 # IOC Watchlist Manager
 
-A full-stack web app for security analysts to maintain a watchlist of Indicators of Compromise (IOCs).
+A full-stack web app where security analysts maintain a watchlist of Indicators of Compromise (IOCs).
 
-## What it does
+---
 
-- Add IOCs (IP addresses, domains, URLs, MD5/SHA-1/SHA-256 hashes) with optional notes and tags
-- Automatically detects the IOC type from the submitted value
-- Normalises indicators so defanged variants (`192[.]168[.]1[.]10`, `hxxps://`) are recognised as duplicates of their canonical forms
-- Filters the watchlist by type and/or tag
-- Deletes individual entries
+## What the project does
+
+Analysts can:
+- **Add** an IOC (IP address, domain, URL, or file hash) with an optional note and one or more tags (e.g. `phishing`, `ransomware`, `c2`)
+- **View** all IOCs with their auto-detected type and tags
+- **Filter** the list by type and/or tag
+- **Delete** an IOC — deletion is soft: the entry moves to a *Recently Deleted* section and is permanently purged after 7 days. It can be restored at any time before that.
+- Submit IOCs in **defanged form** (`hxxps://`, `192[.]168[.]1[.]10`, `evil[.]com`) — the app normalises them automatically and stores the original display value alongside the canonical form
+
+---
 
 ## Tech stack
 
-| Layer      | Technology                      |
-|------------|---------------------------------|
-| Frontend   | Next.js 16 (App Router) + React |
-| Styling    | Tailwind CSS                    |
-| Backend    | Next.js API Routes (TypeScript) |
-| ORM        | Prisma                          |
-| Database   | SQLite (via `better-sqlite3`)   |
+| Layer    | Technology                                       |
+|----------|--------------------------------------------------|
+| Frontend | Next.js 16 (App Router, React, TypeScript)       |
+| Styling  | Tailwind CSS v4                                  |
+| Backend  | Next.js API Routes (same repo, same process)     |
+| ORM      | Prisma 6                                         |
+| Database | SQLite (via Prisma's `better-sqlite3` driver)    |
 
-Single-repo, zero extra services — chosen for simplicity of local development and easy Vercel deployment.
+Single-repo, single-process. Chosen because the scope fits a monolith; it removes all coordination overhead, and deployment is a single `docker run`.
+
+---
 
 ## Architecture & design decisions
 
 ### Normalisation pipeline (`src/lib/ioc.ts`)
 
-Every submitted value goes through:
-1. **Trim whitespace**
-2. **Defang**: `hxxp(s)` → `http(s)`, `[.]` → `.`, `[:]` → `:`, `[//]` → `//`
-3. **URL canonicalisation**: parsed with `new URL()` to strip the fragment (`#...`), remove trailing slashes on root paths, and lowercase the entire value
-4. **Non-URL canonicalisation**: strip trailing dots (FQDN) and slashes, lowercase
+Every submitted value is run through a pipeline before storage or dedup lookup:
 
-The normalised form is stored in a `UNIQUE` column so the database enforces the dedup constraint.
+1. **Trim** leading/trailing whitespace
+2. **Defang** — `hxxp(s)` → `http(s)`, `[.]` → `.`, `[:]` → `:`, `[//]` → `//`
+3. **URL parse** — if the value parses as a URL, use `new URL()` to strip the fragment (`#…`) and any trailing slash on a bare root path, then lowercase the whole string
+4. **Plain value** — otherwise strip trailing dots (FQDN root dot) and trailing slashes, then lowercase
 
-### Type detection
+The normalised string is stored in a `UNIQUE` column (`Ioc.normalized`), so the database itself enforces the dedup constraint regardless of how the duplicate was written.
 
-After normalisation, types are tested in priority order:
-`ipv4` → `sha256` → `sha1` → `md5` → `url` → `domain`
+### Type detection (priority order)
 
-Hash types are matched first so a 64-char hex string is never mistaken for a domain.
+After normalisation, types are matched in this order to avoid ambiguity:
+
+```
+ipv4 → sha256 (64 hex) → sha1 (40 hex) → md5 (32 hex) → url (http/https scheme) → domain
+```
+
+Hashes are tested before domain/URL because a 64-character hex string would otherwise pass the domain regex.
 
 ### Data model
 
 ```
-Ioc ←→ IocTag ←→ Tag   (many-to-many)
+Ioc ──< IocTag >── Tag   (many-to-many join table)
 ```
 
-Tags are stored once and shared; `IocTag` is a join table with a composite PK. Cascade deletes on the Ioc side keep orphan cleanup automatic.
+- `Ioc.normalized` — `UNIQUE`, used for dedup
+- `Ioc.deletedAt` — `NULL` while active; set on soft-delete; row is hard-deleted by a background purge after 7 days
+- `Tag.name` — `UNIQUE`; tags are shared across IOCs and created with `connectOrCreate`
+- `IocTag` has a composite PK `[iocId, tagId]`; cascade-deletes on the `Ioc` side
+
+### Soft-delete & retention
+
+`DELETE /api/iocs/:id` sets `deletedAt` rather than removing the row. `GET /api/iocs` filters `deletedAt: null`. `GET /api/iocs/deleted` lists soft-deleted entries and, as a side-effect, hard-deletes any whose `deletedAt` is older than 7 days (lazy purge — no background worker needed at this scale).
+
+---
 
 ## How to run locally
 
@@ -65,23 +85,33 @@ Open [http://localhost:3000](http://localhost:3000).
 
 ### Environment variables
 
-| Variable       | Default            | Description             |
-|----------------|--------------------|-------------------------|
-| `DATABASE_URL` | `file:./dev.db`    | SQLite file path        |
+| Variable       | Default         | Description          |
+|----------------|-----------------|----------------------|
+| `DATABASE_URL` | `file:./dev.db` | Prisma SQLite path   |
 
-The `.env` file is included in the repo (safe since it only sets a local file path).
+The `.env` file is committed (it contains no secrets — only a local file path).
+
+---
+
+## How to run tests
+
+No automated test suite is included in this submission. The normalisation and type-detection logic in `src/lib/ioc.ts` is the highest-value unit to test; a Jest/Vitest suite would cover cases like defang round-trips, hash-length boundary conditions, URL fragment stripping, and trailing-dot FQDN dedup. With more time this would be the first thing to add.
+
+---
 
 ## API endpoints
 
-| Method   | Path               | Description                                      |
-|----------|--------------------|--------------------------------------------------|
-| `GET`    | `/api/iocs`        | List all IOCs. Query params: `?tag=…&type=…`     |
-| `POST`   | `/api/iocs`        | Create an IOC. Body: `{value, note?, tags?}`     |
-| `DELETE` | `/api/iocs/:id`    | Delete an IOC by ID                              |
+| Method   | Path                  | Description                                                   |
+|----------|-----------------------|---------------------------------------------------------------|
+| `GET`    | `/api/iocs`           | List active IOCs. Query: `?tag=phishing&type=url`             |
+| `POST`   | `/api/iocs`           | Create an IOC                                                 |
+| `DELETE` | `/api/iocs/:id`       | Soft-delete (moves to trash)                                  |
+| `PATCH`  | `/api/iocs/:id`       | Restore from trash                                            |
+| `PUT`    | `/api/iocs/:id`       | Permanently delete immediately                                |
+| `GET`    | `/api/iocs/deleted`   | List soft-deleted IOCs; auto-purges entries older than 7 days |
 
-### POST /api/iocs
+### POST /api/iocs — request body
 
-**Request body:**
 ```json
 {
   "value": "hxxps://evil[.]example[.]com/login",
@@ -90,41 +120,28 @@ The `.env` file is included in the repo (safe since it only sets a local file pa
 }
 ```
 
-**Response 201:**
-```json
-{
-  "id": 1,
-  "value": "hxxps://evil[.]example[.]com/login",
-  "type": "url",
-  "note": "seen in phishing campaign",
-  "createdAt": "2026-10-29T...",
-  "tags": ["phishing", "c2"]
-}
-```
+### Responses
 
-**Error 409 (duplicate):**
-```json
-{
-  "error": "Duplicate: this indicator already exists as entry #1 (\"hxxps://evil[.]example[.]com/login\")",
-  "existingId": 1
-}
-```
+| Status | Meaning                                                             |
+|--------|---------------------------------------------------------------------|
+| 201    | Created                                                             |
+| 409    | Duplicate — body includes `existingId` pointing to the original     |
+| 422    | Value does not match any supported IOC type                         |
+| 400    | Bad request (missing `value`, non-numeric `:id`, etc.)             |
+| 404    | IOC not found                                                       |
 
-**Error 422 (unrecognised type):**
-```json
-{
-  "error": "\"badvalue\" is not a recognised IOC type (ipv4, domain, url, md5, sha1, sha256)"
-}
-```
+---
 
-## Deployment (Docker)
+## Deployment
+
+### Docker
 
 ```bash
 docker build -t ioc-watchlist .
 docker run -p 3000:3000 -v ioc-data:/app/prisma ioc-watchlist
 ```
 
-Or deploy to Vercel (note: Vercel's serverless environment does not support SQLite with a persistent filesystem — swap `DATABASE_URL` for a Postgres connection string and update `prisma/schema.prisma` to `provider = "postgresql"`).
+The volume keeps the SQLite file across container restarts.
 
 ### docker-compose
 
@@ -138,25 +155,48 @@ services:
     volumes:
       - ioc-data:/app/prisma
     environment:
-      - DATABASE_URL=file:./dev.db
-    command: sh -c "npx prisma migrate deploy && node server.js"
+      DATABASE_URL: file:./dev.db
+    command: >
+      sh -c "npx prisma migrate deploy && node server.js"
 volumes:
   ioc-data:
 ```
 
-## Known limitations & improvements with more time
+### Vercel / serverless
 
-- **No pagination** — the list grows unbounded; a cursor-based page API would fix this
-- **No URL dedup across http/https** — `http://evil.com` and `https://evil.com` are stored as separate entries; a policy decision is needed
-- **No edit/update** — analysts can only delete and re-add to change a note or tags
-- **SQLite on Vercel** — would need Postgres (or Turso) for true serverless deployment
-- **No authentication** — any user can delete any entry; OIDC/API-key auth would be the first thing to add in production
-- **Tag autocomplete** — the tag input is free-text; a multi-select with existing tag suggestions would reduce typos
+SQLite requires a persistent filesystem — not available on Vercel's serverless runtime. To deploy there, change `prisma/schema.prisma` to `provider = "postgresql"` and set `DATABASE_URL` to a Postgres connection string (e.g. Neon, Supabase). No application code changes are needed.
+
+---
+
+## Known limitations
+
+- **No pagination** — the full list is fetched on every render; would need cursor-based pagination beyond a few thousand rows
+- **No http/https dedup** — `http://evil.com` and `https://evil.com` are stored as distinct entries; a policy decision is needed on whether they should be collapsed
+- **No tag editing** — analysts must delete and re-add an IOC to change its tags or note
+- **Lazy purge** — the 7-day trash cleanup runs when the deleted list is fetched, not on a schedule; entries won't be purged if nobody opens the trash panel
+- **SQLite in Docker** — not suitable for multi-replica deployments; swap for Postgres for horizontal scale
+- **No auth** — any user can read, add or delete any entry
+
+---
+
+## What I would improve with more time
+
+1. **Unit tests** for `normalize()` and `detectType()` covering edge cases (defang round-trips, hash boundaries, URL fragments, IDN domains)
+2. **Pagination** on `GET /api/iocs` with cursor-based navigation
+3. **Bulk import** — paste or upload a list of IOCs, get a summary of what was added vs. what was already known
+4. **Edit in place** — update note and tags without deleting and re-adding
+5. **Scheduled purge** — replace the lazy-delete with a cron job so stale trash is cleaned up on a guaranteed schedule
+6. **Export** — download the active watchlist as CSV or STIX 2.1 JSON
+7. **Authentication** — even a simple API-key header would prevent unauthorised writes in a shared environment
+
+---
 
 ## Security & domain assumptions
 
-- **Defanging is presentation, not validation** — the original submitted value (including its defanged form) is preserved for display; only the normalised form is used for dedup
-- **URL fragment stripping** — `https://evil.com/page#section` and `https://evil.com/page` are treated as the same indicator since fragments are client-side only and carry no network significance
-- **Case folding** — domains and hashes are lowercased; IP octets are compared numerically after the IPv4 regex match
-- **Trailing dot** — `evil.com.` (FQDN with explicit root dot) normalises to `evil.com`
-- IOC detection is intentionally strict: a value that matches no type is rejected with a 422 rather than stored as "unknown"
+- **Defanging is display-only** — the original submitted value (including brackets) is preserved for display; only the normalised form is used for dedup and type detection. Analysts benefit from seeing what was originally shared.
+- **URL fragment stripping** — `https://evil.com/page#section` and `https://evil.com/page` normalise to the same canonical form. URL fragments are resolved client-side and carry no network significance for tracking purposes.
+- **Case folding** — all values are lowercased. Domains and hashes are case-insensitive in practice; a SHA-256 hash with mixed case refers to the same file as its lowercase form.
+- **Trailing dot (FQDN)** — `evil.com.` normalises to `evil.com`. The trailing dot is valid DNS syntax for the root zone but is never significant for IOC identity.
+- **IPv4 validation** — each octet must be ≤ 255; the regex alone is not sufficient (e.g. `999.0.0.1` matches the pattern but is not a valid address).
+- **No IPv6 support** — out of scope for this submission; the type detector would need an RFC 5952 parser.
+- **Input sanitisation** — all database writes go through Prisma parameterised queries; there is no raw SQL. The `value` and `note` fields are stored as-is and displayed in the UI with React's default escaping (no `dangerouslySetInnerHTML`), so XSS via stored content is not possible.
