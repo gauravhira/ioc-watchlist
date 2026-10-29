@@ -9,10 +9,9 @@ export async function GET(req: NextRequest) {
 
   const iocs = await prisma.ioc.findMany({
     where: {
+      deletedAt: null,
       ...(type ? { type } : {}),
-      ...(tag
-        ? { tags: { some: { tag: { name: tag } } } }
-        : {}),
+      ...(tag ? { tags: { some: { tag: { name: tag } } } } : {}),
     },
     include: { tags: { include: { tag: true } } },
     orderBy: { createdAt: "desc" },

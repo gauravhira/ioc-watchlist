@@ -8,12 +8,13 @@ datasource db {
 }
 
 model Ioc {
-  id         Int      @id @default(autoincrement())
-  value      String   // original value as submitted
-  normalized String   @unique // canonical form for dedup
-  type       String   // ipv4 | domain | url | md5 | sha1 | sha256
+  id         Int       @id @default(autoincrement())
+  value      String
+  normalized String    @unique
+  type       String
   note       String?
-  createdAt  DateTime @default(now())
+  createdAt  DateTime  @default(now())
+  deletedAt  DateTime?
   tags       IocTag[]
 }
 
